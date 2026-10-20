@@ -1,0 +1,56 @@
+/**
+ * @file    problem3.c
+ * @brief   题目三模式管理实现
+ */
+
+#include "problem3.h"
+#include "relay_ctrl.h"
+#include "waveform_display.h"
+
+/* ── 全局模式标志 ────────────────────────────────────────── */
+volatile uint8_t problem3_mode    = 0U;
+volatile uint8_t problem3_pending = 0U;
+
+
+/**
+ * @brief 题目三模块初始化 (main 启动阶段调用一次)
+ *
+ *        初始化继电器 PE6 (默认直连)
+ *
+ *        注意: 串口屏控件初始化延后到 Problem3_Enter()
+ *              因为启动时屏幕显示题目1/2界面
+ */
+void Problem3_Init(void)
+{
+    Relay_Init();
+}
+
+
+/**
+ * @brief 进入题目三模式
+ *
+ *        顺序: (1) 切继电器 (硬件LPF)
+ *              (2) 设模式标志 (主循环据此选择 t3_xxx 显示)
+ *              (3) 初始化 P3 串口屏控件
+ */
+void Problem3_Enter(int hzoom, int scale)
+{
+    Relay_SetLPF();                           /* PE6=HIGH: 切到滤波通路 */
+    HAL_Delay(20U);                           /* 等待继电器和模拟LPF稳定 */
+    problem3_mode = 1U;
+
+    WaveformDisplay_InitP3(hzoom, scale);    /* HMI:  初始化 t3/s9/s10/s18 */
+}
+
+
+/**
+ * @brief 退出题目三模式
+ */
+void Problem3_Exit(void)
+{
+    problem3_mode = 0U;
+    Relay_SetBypass();                        /* PE6=LOW: restore direct path */
+    HAL_Delay(20U);
+
+    WaveformDisplay_ClearP3();               /* HMI:  清空 P3 波形 */
+}

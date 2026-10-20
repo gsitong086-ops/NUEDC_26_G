@@ -1,0 +1,64 @@
+/**
+ * @file    problem3.h
+ * @brief   题目三模式管理
+ *
+ *          page0 按钮 b2 (id=6) 切换题目三模式:
+ *           - 继电器切到 LPF 通路 + 使能数字 LPF
+ *           - 数据显示到 t3_xxx / s9 / s10 / s18 / s19
+ *           - 再次按下退出, 恢复题目1/2 模式
+ *
+ *          problem3_mode 标志:
+ *           0 = 题目1/2 (默认, 直连通路)
+ *           1 = 题目3   (硬件 LPF 通路 + t3_xxx 显示)
+ */
+
+#ifndef __PROBLEM3_H
+#define __PROBLEM3_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdint.h>
+
+/** 题目三模式标志 (0=正常, 1=题目三) */
+extern volatile uint8_t problem3_mode;
+
+/**
+ * 待处理请求 (中断安全):
+ *   0 = 无待处理
+ *   1 = 请求进入题目三模式 (主循环调用 Problem3_Enter)
+ *   2 = 请求退出题目三模式 (主循环调用 Problem3_Exit)
+ *
+ * 中断回调只设置此标志, 不调用 HAL_Delay 等阻塞函数;
+ * 主循环在 while(1) 顶部检测并执行实际切换。
+ */
+extern volatile uint8_t problem3_pending;
+
+/**
+ * @brief 题目三模块初始化 (启动时调用一次)
+ *        初始化继电器 PE6, 启动数字 LPF
+ */
+void Problem3_Init(void);
+
+/**
+ * @brief 进入题目三模式
+ *        - 置 problem3_mode = 1
+ *        - 继电器切 LPF 通路 (PE6=HIGH)
+ *        - 初始化 t3_xxx / s9/s10/s18/s19 显示控件
+ */
+void Problem3_Enter(int hzoom, int scale);
+
+/**
+ * @brief 退出题目三模式
+ *        - 置 problem3_mode = 0
+ *        - 不改变继电器电平；进入题目1/2支路时由对应按键拉低PE6
+ *        - 清除 P3 波形控件
+ */
+void Problem3_Exit(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __PROBLEM3_H */

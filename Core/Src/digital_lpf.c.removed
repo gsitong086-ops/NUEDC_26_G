@@ -1,0 +1,102 @@
+/**
+ * @file    digital_lpf.c
+ * @brief   4阶 Butterworth IIR 数字低通滤波器实现
+ *
+ *          设计参数:
+ *            采样率   fs = 4.0 MHz
+ *            截止频率 fc ≈ 500 kHz (归一化 0.125)
+ *            阶数      4 (2 级双二阶级联)
+ *            窗型      Butterworth (最大平坦度)
+ *            阻带     ≥24dB @ 1MHz, ≥38dB @ 1.5MHz
+ *
+ *          双二阶系数由 bilinear transform + pre-warping 导出:
+ *            Ωc = tan(π·fc/fs) = tan(π·0.125) = 0.41421
+ *            4阶 Butterworth 极点: Q1=0.5412, Q2=1.3066
+ *            → 经双线性变换得以下 10 个 CMSIS-DSP biquad 系数
+ *          (每级: {b0, b1, b2, a1, a2}, 共 2 级)
+ */
+
+#include "digital_lpf.h"
+#include "main.h"
+#include "arm_math.h"
+
+/* ── 滤波系数 (4阶 Butterworth LPF, fc=500kHz@4MSPS) ──────── */
+static float lpf_coeffs[10] = {
+    /* CMSIS-DSP DF1 uses positive feedback terms: {b0,b1,b2,a1,a2}. */
+     0.08857936f, 0.17715871f, 0.08857936f, 0.85539793f, -0.20971536f,
+     0.11525802f, 0.23051603f, 0.11525802f, 1.11302985f, -0.57406192f
+};
+
+/* ── 运行时状态 ──────────────────────────────────────────── */
+#define LPF_NUM_STAGES  2U
+static float lpf_state[LPF_NUM_STAGES * 4U];  /* CMSIS: 4*stages */
+static arm_biquad_casd_df1_inst_f32 lpf_inst;
+static uint8_t  lpf_ready = 0U;
+
+/* ── 临时浮点缓冲 (8192 samples × 4B = 32KB, 静态分配避免栈溢出) ── */
+static float lpf_fbuf[8192U];  /* ADC_SAMPLE_LEN = 8192 */
+
+
+/**
+ * @brief 初始化 IIR 滤波器实例
+ * @return 1=成功, 0=失败
+ */
+uint8_t DigitalLPF_Init(void)
+{
+    /* 清零状态数组 */
+    (void)memset(lpf_state, 0, sizeof(lpf_state));
+
+    /* CMSIS-DSP v1.x: 此函数返回 void */
+    arm_biquad_cascade_df1_init_f32(&lpf_inst,
+                                     LPF_NUM_STAGES,
+                                     lpf_coeffs,
+                                     lpf_state);
+
+    lpf_ready = 1U;
+    return 1U;
+}
+
+
+/**
+ * @brief 对 ADC 数据缓冲执行数字低通滤波 (原地修改)
+ * @param buf uint16_t ADC 原始数据 (12-bit, 0~4095)
+ * @param len 数据长度
+ *
+ * 步骤: (1) 去直流 → float
+ *       (2) biquad cascade 滤波
+ *       (3) 恢复直流 → uint16_t (带钳位)
+ */
+void DigitalLPF_Apply(uint16_t *buf, uint32_t len)
+{
+    uint32_t i;
+
+    if ((lpf_ready == 0U) || (buf == NULL) || (len == 0U) || (len > 8192U))
+    {
+        return;
+    }
+
+    /* ── Step 1: uint16 → centered float ── */
+    for (i = 0U; i < len; i++)
+    {
+        lpf_fbuf[i] = (float)((int32_t)(buf[i] & ADC_DATA_MASK) - 2048);
+    }
+
+    /* ── Step 2: 重置滤波器状态 (帧间独立, 避免拖尾) ── */
+    (void)memset(lpf_state, 0, sizeof(lpf_state));
+    (void)arm_biquad_cascade_df1_init_f32(&lpf_inst,
+                                           LPF_NUM_STAGES,
+                                           lpf_coeffs,
+                                           lpf_state);
+
+    /* ── Step 3: IIR 滤波 ── */
+    arm_biquad_cascade_df1_f32(&lpf_inst, lpf_fbuf, lpf_fbuf, (uint32_t)len);
+
+    /* ── Step 4: float → uint16 (加回直流, 钳位 0~4095) ── */
+    for (i = 0U; i < len; i++)
+    {
+        int32_t val = (int32_t)(lpf_fbuf[i] + 2048.5f);
+        if (val < 0)      { val = 0; }
+        if (val > 4095)   { val = 4095; }
+        buf[i] = (uint16_t)val;
+    }
+}

@@ -1,0 +1,38 @@
+/**
+ * @file    digital_lpf.h
+ * @brief   4阶 Butterworth IIR 数字低通滤波器
+ *          fs=4MHz, fc≈500kHz, 抑制 1~1.5MHz 单频干扰
+ *          配合硬件 1.5MHz LPF 使用, 填补 1~1.5MHz 衰减缺口
+ *
+ *          使用 CMSIS-DSP biquad cascade (2 级 × 2阶 = 4阶)
+ *          阻带特性:
+ *            1.0MHz → -24dB  (200mV → 12.6mV)
+ *            1.5MHz → -38dB  (200mV → 2.5mV)
+ */
+
+#ifndef __DIGITAL_LPF_H
+#define __DIGITAL_LPF_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdint.h>
+
+/** 初始化滤波器 (分配系数 & 状态数组, 注册 CMSIS-DSP 实例) */
+uint8_t DigitalLPF_Init(void);
+
+/**
+ * @brief 对 uint16_t ADC 缓冲进行原地滤波 (4MSPS → 滤除 ≥1MHz)
+ * @param buf  输入/输出缓冲区 (uint16_t, 12-bit ADC data 0~4095)
+ * @param len  采样点数 (通常 ADC_SAMPLE_LEN = 8192)
+ *
+ * 内部流程: uint16→centered float→biquad cascade→clamp→uint16
+ */
+void DigitalLPF_Apply(uint16_t *buf, uint32_t len);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __DIGITAL_LPF_H */

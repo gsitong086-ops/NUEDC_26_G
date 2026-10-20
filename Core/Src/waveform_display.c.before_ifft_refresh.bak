@@ -1,0 +1,794 @@
+#include "waveform_display.h"
+
+#include "hmi.h"
+
+#include <stdio.h>
+#include "arm_math.h"
+#include "fft_analysis.h"
+
+/* ================================================================
+   速度优化:
+   - 每条波形先计算所有点 → 一次性 HMI_AddWaveBatch 发送
+   - 512 点约 760ms @115200bps (逐点 add)
+   ================================================================ */
+#define TWO_PI_F                6.28318530717958647692f
+#define WAVE_CTRL               "t1_wave"       /* ADC 原始波形 */
+#define SYNTH_WAVE_CTRL         "t1_wave_T"     /* FFT 合成单周期波形 */
+#define SYNTH3_WAVE_CTRL        "t1_wave_3T"    /* FFT 合成三周期波形 */
+#define SPECTRUM_CTRL           "t1_spec"       /* 频谱 */
+#define SPECTRUM_POINTS         216U    /* 频谱点数: 铺满频谱控件 */
+#define DISPLAY_STEP_OFFSET     2
+#define DISPLAY_POINT_LIMIT     700U    /* ADC 波形点数: 铺满屏幕控件 */
+#define SYNTH_N_POINTS          680U    /* 合成波形点数: 铺满屏幕控件 */
+#define BATCH_BUF_SIZE          610U    /* 批量缓冲区最大容量 */
+
+/* ── 题目三 (Problem 3) 控件名称 ────────────────────────── */
+#define WAVE_CTRL_P3          "t3_wave"
+#define SPECTRUM_CTRL_P3      "t3_spec"
+#define SYNTH1_CTRL_P3        "t3_wave_T"
+#define SYNTH3_CTRL_P3        "t3_wave_3T"
+
+static uint16_t filtered_samples[WAVEFORM_DISPLAY_MAX_SAMPLES];
+
+void WaveformDisplay_ApplyZoom(int horizontal_zoom, int vertical_scale)
+{
+    char command[32];
+
+    snprintf(command, sizeof(command), "%s.hzoom=%d", WAVE_CTRL, horizontal_zoom);
+    HMI_SendRaw(command);
+    HAL_Delay(5U);
+
+    snprintf(command, sizeof(command), "%s.scale=%d", WAVE_CTRL, vertical_scale);
+    HMI_SendRaw(command);
+}
+
+static void WaveformDisplay_Filter(const uint16_t *samples, uint32_t sample_count)
+{
+    uint32_t i;
+
+    for (i = 0U; i < sample_count; i++)
+    {
+        uint32_t i0 = i;
+        uint32_t i1 = (i >= 1U) ? (i - 1U) : (sample_count - 1U);
+        uint32_t i2 = (i >= 2U) ? (i - 2U) : (sample_count - 2U + i);
+        uint32_t i3 = (i >= 3U) ? (i - 3U) : (sample_count - 3U + i);
+        uint32_t sum = (samples[i0] & ADC_DATA_MASK) +
+                       (samples[i1] & ADC_DATA_MASK) +
+                       (samples[i2] & ADC_DATA_MASK) +
+                       (samples[i3] & ADC_DATA_MASK);
+
+        filtered_samples[i] = (uint16_t)(sum / 4U);
+    }
+}
+
+void WaveformDisplay_Init(int horizontal_zoom, int vertical_scale)
+{
+    char command[32];
+
+    snprintf(command, sizeof(command), "%s.en=1", WAVE_CTRL);
+    HMI_SendRaw(command);
+    HAL_Delay(20U);
+
+    snprintf(command, sizeof(command), "%s.en=1", SYNTH_WAVE_CTRL);
+    HMI_SendRaw(command);
+    HAL_Delay(20U);
+
+    snprintf(command, sizeof(command), "15.en=1");
+    HMI_SendRaw(command);
+    HAL_Delay(20U);
+
+    snprintf(command, sizeof(command), "%s.en=1", SPECTRUM_CTRL);
+    HMI_SendRaw(command);
+    HAL_Delay(20U);
+
+    WaveformDisplay_ApplyZoom(horizontal_zoom, vertical_scale);
+    HAL_Delay(30U);
+
+    HMI_SetText("t1_upp", "---- mV");
+    HAL_Delay(10U);
+    HMI_SetText("t1_urms", "---- mV");
+    HAL_Delay(10U);
+    HMI_SetText("t1_f0", "---- Hz");
+    HAL_Delay(10U);
+    HMI_SetText("t1_fa1", "---- Hz");
+    HAL_Delay(10U);
+    HMI_SetText("t1_f1", "---- Hz");
+    HAL_Delay(10U);
+    HMI_SetText("t1_f2", "---- Hz");
+    HAL_Delay(10U);
+    HMI_SetText("t1_h0", "---- mV");
+    HAL_Delay(10U);
+    HMI_SetText("t1_h1", "---- mV");
+    HAL_Delay(10U);
+    HMI_SetText("t1_h2", "---- mV");
+    HAL_Delay(10U);
+}
+
+void WaveformDisplay_Clear(void)
+{
+    HMI_ClearWave(WAVE_CTRL, 0);
+}
+
+/**
+ * @brief CLEAR 按钮 — 清除所有波形/频谱控件 + 重置文本为 "----"
+ *
+ *        根据 problem3_mode 自动选择对应控件:
+ *          mode=0 → s8(波形) s6(频谱) s16(合成1P) s15(合成3P) t1_xxx
+ *          mode=1 → s9(波形) s10(频谱) s18(合成1P) s19(合成3P) t3_xxx
+ *
+ *        注意: 此函数从 UART 中断回调 (HMI_RxHandler) 中调用,
+ *        使用 HAL_UART_Transmit 轮询发送, 不依赖中断。
+ */
+void WaveformDisplay_ClearAll(void)
+{
+    extern volatile uint8_t problem3_mode;
+
+    if (problem3_mode)
+    {
+        /* ── 题目三控件 ── */
+        HMI_ClearWave(WAVE_CTRL_P3, 0);         /* t3_wave ADC 波形 */
+        HAL_Delay(5U);
+        HMI_ClearWave(SPECTRUM_CTRL_P3, 0);     /* t3_spec 频谱 */
+        HAL_Delay(5U);
+        HMI_ClearWave(SYNTH1_CTRL_P3, 0);       /* t3_wave_T 合成 1 周期 */
+        HAL_Delay(5U);
+        HMI_ClearWave(SYNTH3_CTRL_P3, 0);       /* t3_wave_3T 合成 3 周期 */
+        HAL_Delay(5U);
+
+        /* t3 文本重置 */
+        HMI_SetText("t3_upp",  "---- mV");   HAL_Delay(5U);
+        HMI_SetText("t3_urms", "---- mV");   HAL_Delay(5U);
+        HMI_SetText("t3_f0",   "---- kHz");  HAL_Delay(5U);
+        HMI_SetText("t3_fa1",  "---- kHz");  HAL_Delay(5U);
+        HMI_SetText("t3_f1",   "---- kHz");  HAL_Delay(5U);
+        HMI_SetText("t3_f2",   "---- kHz");  HAL_Delay(5U);
+        HMI_SetText("t3_h0",   "---- mV");   HAL_Delay(5U);
+        HMI_SetText("t3_h1",   "---- mV");   HAL_Delay(5U);
+        HMI_SetText("t3_h2",   "---- mV");   HAL_Delay(5U);
+    }
+    else
+    {
+        /* ── 题目 1/2 控件 ── */
+        HMI_ClearWave(WAVE_CTRL, 0);            /* t1_wave ADC 波形 */
+        HAL_Delay(5U);
+        HMI_ClearWave(SPECTRUM_CTRL, 0);        /* t1_spec 频谱 */
+        HAL_Delay(5U);
+        HMI_ClearWave(SYNTH_WAVE_CTRL, 0);      /* t3_wave_T 合成 1 周期 */
+        HAL_Delay(5U);
+        HMI_ClearWave(SYNTH3_WAVE_CTRL, 0);     /* t3_wave_3T 合成 3 周期 */
+        HAL_Delay(5U);
+
+        /* t1 文本重置 */
+        HMI_SetText("t1_upp",  "---- mV");   HAL_Delay(5U);
+        HMI_SetText("t1_urms", "---- mV");   HAL_Delay(5U);
+        HMI_SetText("t1_f0",   "---- kHz");  HAL_Delay(5U);
+        HMI_SetText("t1_fa1",  "---- kHz");  HAL_Delay(5U);
+        HMI_SetText("t1_f1",   "---- kHz");  HAL_Delay(5U);
+        HMI_SetText("t1_f2",   "---- kHz");  HAL_Delay(5U);
+        HMI_SetText("t1_h0",   "---- mV");   HAL_Delay(5U);
+        HMI_SetText("t1_h1",   "---- mV");   HAL_Delay(5U);
+        HMI_SetText("t1_h2",   "---- mV");   HAL_Delay(5U);
+    }
+}
+
+void WaveformDisplay_SetFrequencyHz(const char *text_control, float frequency_hz)
+{
+    char text[32];
+
+    if (text_control == NULL) { return; }
+
+    if (frequency_hz > 0.0f)
+    {
+        uint32_t rounded_hz = (uint32_t)(frequency_hz + 0.5f);
+        snprintf(text, sizeof(text), "%lu.%03lu kHz",
+                 (unsigned long)(rounded_hz / 1000U),
+                 (unsigned long)(rounded_hz % 1000U));
+    }
+    else
+    {
+        snprintf(text, sizeof(text), "---- kHz");
+    }
+
+    HMI_SetText(text_control, text);
+}
+
+void WaveformDisplay_SetAmplitudeMV(const char *text_control, float magnitude)
+{
+    char text[32];
+
+    if (text_control == NULL) { return; }
+
+    if (magnitude > 0.0f)
+    {
+        float mvpp = FFT_MAG_TO_VPP_MV(magnitude);
+        int32_t mv_milli = (int32_t)(mvpp * 1000.0f + 0.5f);
+        if (mv_milli < 1) { mv_milli = 1; }
+        snprintf(text, sizeof(text), "%ld.%03ld mV",
+                 (long)(mv_milli / 1000L),
+                 (long)(mv_milli % 1000L));
+    }
+    else
+    {
+        snprintf(text, sizeof(text), "---- mV");
+    }
+
+    HMI_SetText(text_control, text);
+}
+
+void WaveformDisplay_SetRMSMV(const char *text_control, float rms_mv)
+{
+    char text[32];
+
+    if (text_control == NULL) { return; }
+
+    if (rms_mv > 0.0f)
+    {
+        int32_t mv_milli = (int32_t)(rms_mv * 1000.0f + 0.5f);
+        if (mv_milli < 1) { mv_milli = 1; }
+        snprintf(text, sizeof(text), "%ld.%03ld mV",
+                 (long)(mv_milli / 1000L),
+                 (long)(mv_milli % 1000L));
+    }
+    else
+    {
+        snprintf(text, sizeof(text), "---- mV");
+    }
+
+    HMI_SetText(text_control, text);
+}
+
+void WaveformDisplay_SetUppMV(const char *text_control, float upp_mv)
+{
+    char text[32];
+
+    if (text_control == NULL) { return; }
+
+    if (upp_mv > 0.0f)
+    {
+        int32_t mv_milli = (int32_t)(upp_mv * 1000.0f + 0.5f);
+        if (mv_milli < 1) { mv_milli = 1; }
+        snprintf(text, sizeof(text), "%ld.%03ld mV",
+                 (long)(mv_milli / 1000L),
+                 (long)(mv_milli % 1000L));
+    }
+    else
+    {
+        snprintf(text, sizeof(text), "---- mV");
+    }
+
+    HMI_SetText(text_control, text);
+}
+
+/* ================================================================
+   合成波形显示
+   ================================================================ */
+
+static void WaveformDisplay_SynthDraw(const char *ctrl_id,
+                                       uint32_t n_periods,
+                                       uint32_t skip_periods,
+                                       const volatile uint8_t *run_flag)
+{
+    float amp_mv[3], freq_hz[3];
+    uint8_t n = 0U;
+    float T, dt, half_range, scale;
+    uint32_t i, j;
+    uint8_t points[SYNTH_N_POINTS];
+
+    if (!g_fft_result.valid || g_fft_result.upp_mv <= 0.0f) { return; }
+
+    /* 收集 FFT 分量 — 精确插值频率 + 幅值, 全部 φ=0 */
+    amp_mv[n]  = FFT_MAG_TO_VPP_MV(g_fft_result.peak_magnitude);
+    freq_hz[n] = g_fft_result.fundamental_hz;
+    n++;
+
+    if (g_fft_result.harmonic1_hz > 0.0f)
+    {
+        amp_mv[n]  = FFT_MAG_TO_VPP_MV(g_fft_result.harmonic1_magnitude);
+        freq_hz[n] = g_fft_result.harmonic1_hz;
+        n++;
+    }
+    if (g_fft_result.harmonic2_hz > 0.0f)
+    {
+        amp_mv[n]  = FFT_MAG_TO_VPP_MV(g_fft_result.harmonic2_magnitude);
+        freq_hz[n] = g_fft_result.harmonic2_hz;
+        n++;
+    }
+
+    T  = 1.0f / freq_hz[0];
+    dt = (float)n_periods * T / (float)SYNTH_N_POINTS;
+
+    /* 定标: ±55% Upp, 映射到 1~254 留边距, 确保不超出框图 */
+    half_range = g_fft_result.upp_mv * 0.55f;
+    if (half_range < 1.0f) { half_range = 1.0f; }
+    scale = 126.5f / half_range;
+
+    /* 预计算所有点 → 批量发送 */
+    for (i = 0U; i < SYNTH_N_POINTS; i++)
+    {
+        float t   = (float)skip_periods * T + (float)i * dt;
+        float val = 0.0f;
+        int32_t dv;
+
+        if ((run_flag != NULL) && (*run_flag == 0U)) { return; }
+
+        for (j = 0U; j < n; j++)
+        {
+            val += amp_mv[j] * arm_sin_f32(TWO_PI_F * freq_hz[j] * t);
+        }
+
+        dv = (int32_t)(127.5f - val * scale);  /* 负逻辑 */
+        if (dv < 1)   { dv = 1; }
+        if (dv > 254) { dv = 254; }
+        points[i] = (uint8_t)dv;
+    }
+
+    HMI_ClearWave(ctrl_id, 0);
+    HAL_Delay(5U);
+    HMI_AddWaveBatch(ctrl_id, 0, points, SYNTH_N_POINTS, run_flag);
+}
+
+/* 单周期合成波形 → sid=16, 跳过第1周期显示完整第2周期 */
+void WaveformDisplay_DrawSynthesized(const volatile uint8_t *run_flag)
+{
+    WaveformDisplay_SynthDraw(SYNTH_WAVE_CTRL, 1U, 1U, run_flag);
+}
+
+/* 三周期合成波形 → sid=15, 从 t=0 开始 */
+void WaveformDisplay_DrawSynthesized3P(const volatile uint8_t *run_flag)
+{
+    WaveformDisplay_SynthDraw(SYNTH3_WAVE_CTRL, 3U, 0U, run_flag);
+}
+
+typedef struct
+{
+    uint32_t start;
+    uint32_t step;
+    uint32_t interpolation;
+} WaveformDisplay_Layout;
+
+static void WaveformDisplay_CalculateLayout(int horizontal_zoom,
+                                             uint32_t sample_count,
+                                             WaveformDisplay_Layout *layout)
+{
+    int64_t exponent = (int64_t)horizontal_zoom + DISPLAY_STEP_OFFSET;
+
+    layout->start = 4U;
+    layout->step = 1U;
+    layout->interpolation = 1U;
+
+    if (exponent >= 0)
+    {
+        uint64_t span;
+
+        while ((exponent > 0) && (layout->step < sample_count))
+        {
+            layout->step <<= 1U;
+            exponent--;
+        }
+
+        /* 只发送屏幕真正能显示的最后一段，避免无效滚屏。 */
+        span = (uint64_t)DISPLAY_POINT_LIMIT * layout->step;
+        if ((span + 4U) < sample_count)
+        {
+            layout->start = sample_count - (uint32_t)span;
+        }
+    }
+    else
+    {
+        uint32_t intervals;
+
+        /* 步长已到1后继续X放大：增加相邻采样点之间的插值点。 */
+        while ((exponent < 0) &&
+               (layout->interpolation < DISPLAY_POINT_LIMIT))
+        {
+            layout->interpolation <<= 1U;
+            exponent++;
+        }
+
+        intervals = DISPLAY_POINT_LIMIT / layout->interpolation;
+        if (intervals < 1U) { intervals = 1U; }
+        if ((intervals + 5U) < sample_count)
+        {
+            layout->start = sample_count - 1U - intervals;
+        }
+    }
+}
+
+static int32_t WaveformDisplay_ScaleSample(int32_t centered,
+                                            int vertical_scale)
+{
+    int64_t scaled;
+
+    if (vertical_scale > 0)
+    {
+        scaled = (int64_t)centered * (int64_t)vertical_scale * 6;
+    }
+    else
+    {
+        scaled = (int64_t)centered / (1 - (int64_t)vertical_scale);
+    }
+
+    scaled += 2048;
+    if (scaled < 0)       { scaled = 0; }
+    if (scaled > 4095)    { scaled = 4095; }
+
+    return (int32_t)scaled;
+}
+
+void WaveformDisplay_Draw(const uint16_t *samples,
+                          uint32_t sample_count,
+                          int horizontal_zoom,
+                          int vertical_scale,
+                          const volatile uint8_t *run_flag)
+{
+    uint32_t i;
+    uint32_t sent_points = 0U;
+    WaveformDisplay_Layout layout;
+    uint8_t points[DISPLAY_POINT_LIMIT];
+
+    if ((samples == NULL) || (sample_count < 4U) ||
+        (sample_count > WAVEFORM_DISPLAY_MAX_SAMPLES))
+    {
+        return;
+    }
+
+    WaveformDisplay_CalculateLayout(horizontal_zoom, sample_count, &layout);
+    WaveformDisplay_Filter(samples, sample_count);
+
+    /* 预计算所有显示点 → 填充批量缓冲区 */
+    for (i = layout.start;
+         (i + layout.step) < sample_count && sent_points < DISPLAY_POINT_LIMIT;
+         i += layout.step)
+    {
+        int32_t raw0 = (int32_t)(filtered_samples[i] & ADC_DATA_MASK);
+        int32_t raw1 = (int32_t)(filtered_samples[i + layout.step] & ADC_DATA_MASK);
+        uint32_t sub;
+
+        for (sub = 0U;
+             sub < layout.interpolation && sent_points < DISPLAY_POINT_LIMIT;
+             sub++)
+        {
+            int32_t raw;
+            int32_t amplitude;
+
+            if ((run_flag != NULL) && (*run_flag == 0U)) { return; }
+
+            raw = raw0 + ((raw1 - raw0) * (int32_t)sub) /
+                         (int32_t)layout.interpolation;
+            amplitude = WaveformDisplay_ScaleSample(2048 - raw, vertical_scale);
+            points[sent_points] = (uint8_t)(amplitude >> 4);
+            sent_points++;
+        }
+    }
+
+    /* 清屏后批量发送 */
+    WaveformDisplay_Clear();
+    if (sent_points > 0U)
+    {
+        HMI_AddWaveBatch(WAVE_CTRL, 0, points, (uint16_t)sent_points, run_flag);
+    }
+}
+
+/* ================================================================
+   定性频谱图
+   ================================================================ */
+#define SPEC_BAR_WIDTH   2U
+void WaveformDisplay_Spectrum(const volatile uint8_t *run_flag)
+{
+    float freqs[3], mags[3];
+    uint32_t positions[3];
+    uint32_t i, p, count;
+    float max_freq;
+    uint8_t bars[SPECTRUM_POINTS];
+
+    if (!g_fft_result.valid) { return; }
+
+    /* 收集有效频率成分 */
+    count = 0U;
+    freqs[count] = g_fft_result.fundamental_hz;
+    mags[count]  = g_fft_result.peak_magnitude;
+    count++;
+
+    if (g_fft_result.harmonic1_hz > 0.0f)
+    {
+        freqs[count] = g_fft_result.harmonic1_hz;
+        mags[count]  = g_fft_result.harmonic1_magnitude;
+        count++;
+    }
+    if (g_fft_result.harmonic2_hz > 0.0f)
+    {
+        freqs[count] = g_fft_result.harmonic2_hz;
+        mags[count]  = g_fft_result.harmonic2_magnitude;
+        count++;
+    }
+    if (count == 0U) { return; }
+
+    /* 最高频率映射到 ~230，留右边距
+       (SPECTRUM_POINTS=256 → 频率高→位置小, 映射范围 8~238) */
+    max_freq = freqs[count - 1U];
+    if (max_freq < 1.0f) { max_freq = 1.0f; }
+
+    for (i = 0U; i < count; i++)
+    {
+        positions[i] = (uint32_t)((max_freq - freqs[i]) / max_freq
+                                  * (float)(SPECTRUM_POINTS - 26) + 8.0f);
+        if (positions[i] >= SPECTRUM_POINTS) { positions[i] = SPECTRUM_POINTS - 1U; }
+    }
+
+    /* 预计算所有频谱条 */
+    for (p = 0U; p < SPECTRUM_POINTS; p++)
+    {
+        uint8_t bar = 0U;
+        uint32_t k;
+
+        if ((run_flag != NULL) && (*run_flag == 0U)) { return; }
+
+        for (k = 0U; k < count; k++)
+        {
+            if (p >= positions[k] && p < positions[k] + SPEC_BAR_WIDTH)
+            {
+                float mvpp = FFT_MAG_TO_VPP_MV(mags[k]);
+                int32_t h = (int32_t)(mvpp * 3.0f);
+                if (h > 255) { h = 255; }
+                if (h < 1)   { h = 1; }
+                bar = (uint8_t)h;
+                break;
+            }
+        }
+        bars[p] = bar;
+    }
+
+    HMI_ClearWave(SPECTRUM_CTRL, 0);
+    HAL_Delay(5U);
+    HMI_AddWaveBatch(SPECTRUM_CTRL, 0, bars, SPECTRUM_POINTS, run_flag);
+}
+
+/* ════════════════════════════════════════════════════════════
+   题目三 (Problem 3) 显示函数
+   - 波形控件: s9(ADC),  s10(频谱),  s18(合成1P),  s19(合成3P)
+   - 文本控件: t3_upp / t3_urms / t3_f0 / t3_fa1 / t3_f1 / t3_f2
+               t3_h0 / t3_h1 / t3_h2
+   - 复用核心绘制逻辑, 仅切换控件 ID 字符串
+   ════════════════════════════════════════════════════════════ */
+
+void WaveformDisplay_ApplyZoomP3(int horizontal_zoom, int vertical_scale)
+{
+    char command[32];
+
+    snprintf(command, sizeof(command), "%s.hzoom=%d",
+             WAVE_CTRL_P3, horizontal_zoom);
+    HMI_SendRaw(command);
+    HAL_Delay(5U);
+
+    snprintf(command, sizeof(command), "%s.scale=%d",
+             WAVE_CTRL_P3, vertical_scale);
+    HMI_SendRaw(command);
+}
+
+void WaveformDisplay_InitP3(int horizontal_zoom, int vertical_scale)
+{
+    char command[32];
+
+    /* 使能 P3 波形控件 */
+    snprintf(command, sizeof(command), "%s.en=1", WAVE_CTRL_P3);
+    HMI_SendRaw(command);
+    HAL_Delay(20U);
+
+    snprintf(command, sizeof(command), "%s.en=1", SYNTH1_CTRL_P3);
+    HMI_SendRaw(command);
+    HAL_Delay(20U);
+
+    snprintf(command, sizeof(command), "%s.en=1", SYNTH3_CTRL_P3);
+    HMI_SendRaw(command);
+    HAL_Delay(20U);
+
+    snprintf(command, sizeof(command), "%s.en=1", SPECTRUM_CTRL_P3);
+    HMI_SendRaw(command);
+    HAL_Delay(20U);
+
+    /* Clear t3_wave once on entry; subsequent IFFT frames append continuously. */
+    HMI_ClearWave(WAVE_CTRL_P3, 0);
+    HAL_Delay(5U);
+
+    WaveformDisplay_ApplyZoomP3(horizontal_zoom, vertical_scale);
+    HAL_Delay(30U);
+
+    /* 初始化 t3_xxx 文本控件为 "----" */
+    HMI_SetText("t3_upp", "---- mV");   HAL_Delay(10U);
+    HMI_SetText("t3_urms","---- mV");   HAL_Delay(10U);
+    HMI_SetText("t3_f0",  "---- kHz");  HAL_Delay(10U);
+    HMI_SetText("t3_fa1", "---- kHz");  HAL_Delay(10U);
+    HMI_SetText("t3_f1",  "---- kHz");  HAL_Delay(10U);
+    HMI_SetText("t3_f2",  "---- kHz");  HAL_Delay(10U);
+    HMI_SetText("t3_h0",  "---- mV");   HAL_Delay(10U);
+    HMI_SetText("t3_h1",  "---- mV");   HAL_Delay(10U);
+    HMI_SetText("t3_h2",  "---- mV");   HAL_Delay(10U);
+}
+
+void WaveformDisplay_ClearP3(void)
+{
+    HMI_ClearWave(WAVE_CTRL_P3, 0);
+}
+
+void WaveformDisplay_DrawP3(const uint16_t *samples,
+                             uint32_t sample_count,
+                             int horizontal_zoom,
+                             int vertical_scale,
+                             const volatile uint8_t *run_flag)
+{
+    uint32_t i;
+    uint32_t sent_points = 0U;
+    WaveformDisplay_Layout layout;
+    uint8_t points[DISPLAY_POINT_LIMIT];
+
+    if ((samples == NULL) || (sample_count < 4U) ||
+        (sample_count > WAVEFORM_DISPLAY_MAX_SAMPLES))
+    {
+        return;
+    }
+
+    WaveformDisplay_CalculateLayout(horizontal_zoom, sample_count, &layout);
+    /* 复用题目1/2 的 4点滑动平均滤波结果 (filtered_samples 已在
+       WaveformDisplay_Draw 中计算, 此处独立调用 Filter 确保正确) */
+    WaveformDisplay_Filter(samples, sample_count);
+
+    for (i = layout.start;
+         (i + layout.step) < sample_count && sent_points < DISPLAY_POINT_LIMIT;
+         i += layout.step)
+    {
+        int32_t raw0 = (int32_t)(filtered_samples[i] & ADC_DATA_MASK);
+        int32_t raw1 = (int32_t)(filtered_samples[i + layout.step] & ADC_DATA_MASK);
+        uint32_t sub;
+
+        for (sub = 0U;
+             sub < layout.interpolation && sent_points < DISPLAY_POINT_LIMIT;
+             sub++)
+        {
+            int32_t raw;
+            int32_t amplitude;
+
+            if ((run_flag != NULL) && (*run_flag == 0U)) { return; }
+
+            raw = raw0 + ((raw1 - raw0) * (int32_t)sub) /
+                         (int32_t)layout.interpolation;
+            amplitude = WaveformDisplay_ScaleSample(2048 - raw, vertical_scale);
+            points[sent_points] = (uint8_t)(amplitude >> 4);
+            sent_points++;
+        }
+    }
+
+    WaveformDisplay_ClearP3();
+    if (sent_points > 0U)
+    {
+        HMI_AddWaveBatch(WAVE_CTRL_P3, 0, points,
+                         (uint16_t)sent_points, run_flag);
+    }
+}
+
+void WaveformDisplay_DrawIFFTP3(int horizontal_zoom,
+                                   int vertical_scale,
+                                   const volatile uint8_t *run_flag)
+{
+    uint32_t sample_count = 0U;
+    const float *samples = FFT_GetIFFTWaveform(&sample_count);
+    uint32_t i;
+    uint32_t sent_points = 0U;
+    WaveformDisplay_Layout layout;
+    uint8_t points[DISPLAY_POINT_LIMIT];
+
+    if ((samples == NULL) || (sample_count < 4U)) { return; }
+
+    WaveformDisplay_CalculateLayout(horizontal_zoom, sample_count, &layout);
+
+    for (i = layout.start;
+         (i + layout.step) < sample_count && sent_points < DISPLAY_POINT_LIMIT;
+         i += layout.step)
+    {
+        float v0 = samples[i];
+        float v1 = samples[i + layout.step];
+        uint32_t sub;
+
+        for (sub = 0U;
+             sub < layout.interpolation && sent_points < DISPLAY_POINT_LIMIT;
+             sub++)
+        {
+            float value;
+            int32_t amplitude;
+
+            if ((run_flag != NULL) && (*run_flag == 0U)) { return; }
+
+            value = v0 + ((v1 - v0) * (float)sub) /
+                         (float)layout.interpolation;
+            amplitude = WaveformDisplay_ScaleSample(-(int32_t)value,
+                                                     vertical_scale);
+            points[sent_points++] = (uint8_t)(amplitude >> 4);
+        }
+    }
+
+    if (sent_points > 0U)
+    {
+        HMI_AddWaveBatch(WAVE_CTRL_P3, 0, points,
+                         (uint16_t)sent_points, run_flag);
+    }
+}
+
+void WaveformDisplay_SpectrumP3(const volatile uint8_t *run_flag)
+{
+    float freqs[3], mags[3];
+    uint32_t positions[3];
+    uint32_t i, p, count;
+    float max_freq;
+    uint8_t bars[SPECTRUM_POINTS];
+
+    if (!g_fft_result.valid) { return; }
+
+    count = 0U;
+    freqs[count] = g_fft_result.fundamental_hz;
+    mags[count]  = g_fft_result.peak_magnitude;
+    count++;
+
+    if (g_fft_result.harmonic1_hz > 0.0f)
+    {
+        freqs[count] = g_fft_result.harmonic1_hz;
+        mags[count]  = g_fft_result.harmonic1_magnitude;
+        count++;
+    }
+    if (g_fft_result.harmonic2_hz > 0.0f)
+    {
+        freqs[count] = g_fft_result.harmonic2_hz;
+        mags[count]  = g_fft_result.harmonic2_magnitude;
+        count++;
+    }
+    if (count == 0U) { return; }
+
+    max_freq = freqs[count - 1U];
+    if (max_freq < 1.0f) { max_freq = 1.0f; }
+
+    for (i = 0U; i < count; i++)
+    {
+        positions[i] = (uint32_t)((max_freq - freqs[i]) / max_freq
+                                  * (float)(SPECTRUM_POINTS - 26) + 8.0f);
+        if (positions[i] >= SPECTRUM_POINTS)
+        {
+            positions[i] = SPECTRUM_POINTS - 1U;
+        }
+    }
+
+    for (p = 0U; p < SPECTRUM_POINTS; p++)
+    {
+        uint8_t bar = 0U;
+        uint32_t k;
+
+        if ((run_flag != NULL) && (*run_flag == 0U)) { return; }
+
+        for (k = 0U; k < count; k++)
+        {
+            if (p >= positions[k] && p < positions[k] + SPEC_BAR_WIDTH)
+            {
+                float mvpp = FFT_MAG_TO_VPP_MV(mags[k]);
+                int32_t h = (int32_t)(mvpp * 3.0f);
+                if (h > 255) { h = 255; }
+                if (h < 1)   { h = 1; }
+                bar = (uint8_t)h;
+                break;
+            }
+        }
+        bars[p] = bar;
+    }
+
+    HMI_ClearWave(SPECTRUM_CTRL_P3, 0);
+    HAL_Delay(5U);
+    HMI_AddWaveBatch(SPECTRUM_CTRL_P3, 0, bars, SPECTRUM_POINTS, run_flag);
+}
+
+/* ── 合成波形 (复用 SynthDraw 私有函数) ────────────────────── */
+
+void WaveformDisplay_DrawSynthesizedP3(const volatile uint8_t *run_flag)
+{
+    WaveformDisplay_SynthDraw(SYNTH1_CTRL_P3, 1U, 1U, run_flag);
+}
+
+void WaveformDisplay_DrawSynthesized3PP3(const volatile uint8_t *run_flag)
+{
+    WaveformDisplay_SynthDraw(SYNTH3_CTRL_P3, 3U, 0U, run_flag);
+}
